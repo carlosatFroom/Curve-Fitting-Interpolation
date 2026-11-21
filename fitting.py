@@ -4,7 +4,7 @@ import itertools
 from dataclasses import dataclass, field
 
 import numpy as np
-from numpy.polynomial import Polynomial
+from numpy.polynomial import Polynomial, legendre
 
 
 def chunk_bounds(n_points, n_chunks, overlap_pct=0.0):
@@ -188,3 +188,195 @@ def extrapolate(x, y, fit_fraction, order):
     n_fit = min(n, max(int(order) + 1, int(round(fit_fraction * n))))
     poly = _fit_poly(x[:n_fit], y[:n_fit], order)
     return _poly_coeffs(poly), poly(x)
+
+
+def adaptive_chunks(x, y, order, tol, max_chunks):
+    """Greedy contiguous partition where each degree-`order` chunk has RMSE <= tol.
+
+    Chunks never shorter than 2*(order+1) (a shorter remainder is folded into the
+    previous chunk). If more than `max_chunks` chunks are needed, the tail is merged
+    into the last allowed chunk, which may then exceed tol.
+    """
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    if x.shape != y.shape or x.ndim != 1:
+        raise ValueError("x and y must be 1-D arrays of equal length")
+    if int(max_chunks) < 1:
+        raise ValueError("max_chunks must be >= 1")
+    if tol < 0:
+        raise ValueError("tol must be >= 0")
+    order, n = int(order), len(x)
+    min_len = 2 * (order + 1)
+
+    def ok(s, e):
+        xs, ys = x[s:e], y[s:e]
+        return rmse(ys, _fit_poly(xs, ys, order)(xs)) <= tol
+
+    parts, s = [], 0
+    while s < n:
+        if n - s <= min_len or ok(s, n):
+            parts.append((s, n))
+            break
+        lo, hi = min(s + min_len, n), n  # lo assumed fine, hi known bad
+        while hi - lo > 1:
+            mid = (lo + hi) // 2
+            if ok(s, mid):
+                lo = mid
+            else:
+                hi = mid
+        e = lo
+        if 0 < n - e < min_len:
+            e = n - min_len if n - min_len >= s + min_len else n
+        parts.append((s, e))
+        s = e
+    if len(parts) > max_chunks:
+        parts = parts[:int(max_chunks) - 1] + [(parts[int(max_chunks) - 1][0], n)]
+    return parts
+
+
+def _robust_poly(xs, ys, order):
+    """Tukey-bisquare IRLS polynomial fit (scale = 1.4826 * MAD of residuals)."""
+    order = min(int(order), len(xs) - 1)
+    if order <= 0 or np.ptp(xs) == 0:
+        return Polynomial([float(np.median(ys))])
+    c = 4.685
+    poly = Polynomial.fit(xs, ys, order)
+    for _ in range(30):
+        r = ys - poly(xs)
+        scale = 1.4826 * np.median(np.abs(r - np.median(r)))
+        if scale == 0:
+            break
+        u = r / (c * scale)
+        w = np.where(np.abs(u) < 1, (1 - u ** 2) ** 2, 0.0)
+        if np.count_nonzero(w) <= order:
+            break
+        new = Polynomial.fit(xs, ys, order, w=np.sqrt(w))
+        converged = np.allclose(new.coef, poly.coef, rtol=1e-10, atol=1e-12)
+        poly = new
+        if converged:
+            break
+    return poly
+
+
+def robust_fit_chunks(x, y, n_chunks, order, overlap_pct=0.0):
+    """Like fit_chunks, but each chunk uses a Tukey-bisquare IRLS fit."""
+    return _make_chunk_fits(x, y, n_chunks, order, overlap_pct, _robust_poly)
+
+
+def select_order(x, y, n_chunks, max_order, method="cv"):
+    """Pick the order in [0, max_order] by 5-fold CV ("cv") or AIC ("aic")."""
+    if method not in ("cv", "aic"):
+        raise ValueError(f"unknown method {method!r}; use 'cv' or 'aic'")
+    if int(max_order) < 0:
+        raise ValueError("max_order must be >= 0")
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    n, n_chunks = len(x), int(n_chunks)
+    scores = []
+    if method == "aic":
+        for order in range(int(max_order) + 1):
+            fits = fit_chunks(x, y, n_chunks, order)
+            rss = float(np.sum((y - evaluate_piecewise(fits, x, blend=False)) ** 2))
+            k_params = n_chunks * (order + 1)
+            scores.append(n * np.log(rss / n + 1e-300) + 2 * k_params)
+    else:
+        k = 5
+        if n < k:
+            raise ValueError(f"need at least {k} points for cv, got {n}")
+        idx = np.arange(n)
+        for order in range(int(max_order) + 1):
+            sse = 0.0
+            for f in range(k):
+                test = idx % k == f
+                train = ~test
+                if train.sum() < n_chunks:
+                    raise ValueError("training folds have fewer points than n_chunks")
+                fits = fit_chunks(x[train], y[train], n_chunks, order)
+                pred = evaluate_piecewise(fits, x[test], blend=False)
+                sse += float(np.sum((y[test] - pred) ** 2))
+            scores.append(sse / n)
+    return int(np.argmin(scores))
+
+
+@dataclass
+class SplineFit:
+    knots: np.ndarray
+    order: int
+    continuity: int
+    centers: np.ndarray = field(repr=False)
+    half_widths: np.ndarray = field(repr=False)
+    coefs: np.ndarray = field(repr=False)  # (n_pieces, order + 1) Legendre coefs in local t
+
+    def piece_index(self, xq):
+        return np.searchsorted(self.knots, xq, side="right")
+
+    def _eval_piece(self, j, xq, m=0):
+        c = legendre.legder(self.coefs[j], m) if m else self.coefs[j]
+        t = (xq - self.centers[j]) / self.half_widths[j]
+        return legendre.legval(t, c) / self.half_widths[j] ** m
+
+    def derivative(self, xq, m=1):
+        if m < 0:
+            raise ValueError("m must be >= 0")
+        xq = np.asarray(xq, dtype=float)
+        flat = np.atleast_1d(xq).ravel()
+        idx = self.piece_index(flat)
+        out = np.empty_like(flat)
+        for j in np.unique(idx):
+            sel = idx == j
+            out[sel] = self._eval_piece(j, flat[sel], m)
+        return out.reshape(xq.shape) if xq.ndim else out[0]
+
+    def predict(self, xq):
+        return self.derivative(xq, 0)
+
+
+def _leg_derivative_rows(t, deg, m):
+    """Row of d^m/dt^m of each Legendre basis function at scalar t."""
+    eye = np.eye(deg + 1)
+    return np.array([legendre.legval(t, legendre.legder(eye[k], m)) if m else legendre.legval(t, eye[k])
+                     for k in range(deg + 1)])
+
+
+def fit_spline(x, y, n_chunks, order, continuity=2):
+    """Jointly constrained least-squares piecewise polynomial (C^continuity at knots)."""
+    order, continuity = int(order), int(continuity)
+    if not -1 <= continuity < order:
+        raise ValueError("continuity must satisfy -1 <= continuity < order")
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    base = chunk_bounds(len(x), n_chunks, 0)
+    knots = np.array([x[s] for s, _ in base[1:]], dtype=float)
+    edges = np.concatenate(([x[0]], knots, [x[-1]]))
+    centers = 0.5 * (edges[:-1] + edges[1:])
+    half = 0.5 * (edges[1:] - edges[:-1])
+    half[half <= 0] = 1.0
+    p = order + 1
+    n_pieces = len(base)
+
+    design = np.zeros((len(x), n_pieces * p))
+    for j, (s, e) in enumerate(base):
+        t = (x[s:e] - centers[j]) / half[j]
+        design[s:e, j * p:(j + 1) * p] = legendre.legvander(t, order)
+
+    rows = []
+    for i, k in enumerate(knots):
+        h_ref = 0.5 * (half[i] + half[i + 1])
+        tl = (k - centers[i]) / half[i]
+        tr = (k - centers[i + 1]) / half[i + 1]
+        for m in range(continuity + 1):
+            row = np.zeros(n_pieces * p)
+            row[i * p:(i + 1) * p] = _leg_derivative_rows(tl, order, m) * (h_ref / half[i]) ** m
+            row[(i + 1) * p:(i + 2) * p] = -_leg_derivative_rows(tr, order, m) * (h_ref / half[i + 1]) ** m
+            rows.append(row)
+
+    if rows:
+        cons = np.array(rows)
+        q, _ = np.linalg.qr(cons.T, mode="complete")
+        null = q[:, cons.shape[0]:]
+        z = np.linalg.lstsq(design @ null, y, rcond=None)[0]
+        sol = null @ z
+    else:
+        sol = np.linalg.lstsq(design, y, rcond=None)[0]
+    return SplineFit(knots=knots, order=order, continuity=continuity, centers=centers,
+                     half_widths=half, coefs=sol.reshape(n_pieces, p))
