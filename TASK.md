@@ -1,4 +1,4 @@
-# Task: make the curve-fitting algorithm correct, testable and fast
+# Task: make the curve-fitting algorithm correct, testable, fast and better
 
 `app.py` welds the fitting algorithm to the PyQt GUI and has several bugs.
 Extract the algorithm into a pure module, fix it, improve it, and test it.
@@ -76,6 +76,50 @@ extrapolate(x, y, fit_fraction: float, order: int) -> tuple[np.ndarray, np.ndarr
 ```
 Fit one polynomial to the first `fit_fraction` (0 < f <= 1) of the points
 (at least `order + 1` points), return `(coeffs, y_pred_over_all_x)`.
+
+
+## Phase 2: algorithm improvements (also required, also in `fitting.py`)
+
+```python
+fit_spline(x, y, n_chunks: int, order: int, continuity: int = 2) -> SplineFit
+```
+One polynomial of degree `order` per base chunk (`chunk_bounds(n, n_chunks, 0)`), solved
+**jointly** as a single constrained least-squares problem (minimise total squared error over
+all points subject to the constraints, not fit-then-patch). Knot `i` is `x[start of base chunk i+1]`;
+a point at a knot belongs to the right-hand piece. At every knot the value and the first
+`continuity` derivatives of adjacent pieces must be equal (`continuity` = -1 means no
+constraint, 0 = C0, 1 = C1, 2 = C2). Raise `ValueError` unless `-1 <= continuity < order`.
+Must be numerically stable for order up to 10 and 50 chunks.
+`SplineFit` exposes `knots` (np.ndarray), `predict(xq)` and `derivative(xq, m=1)`
+(m-th derivative w.r.t. original x, m >= 0).
+
+```python
+adaptive_chunks(x, y, order: int, tol: float, max_chunks: int) -> list[tuple[int, int]]
+```
+Choose chunk boundaries automatically: return a contiguous partition of `[0, len(x))`
+(half-open, sorted) such that a degree-`order` fit on every chunk has RMSE <= `tol`,
+using as few chunks as reasonably possible and never more than `max_chunks`. A chunk with
+fewer than `2 * (order + 1)` points may exceed `tol`.
+
+```python
+robust_fit_chunks(x, y, n_chunks: int, order: int, overlap_pct: float = 0.0) -> list[ChunkFit]
+```
+Same contract as `fit_chunks`, but resistant to outliers (e.g. Huber/Tukey IRLS with a
+robust scale estimate). With 10% gross outliers the fit should track the clean signal.
+
+```python
+select_order(x, y, n_chunks: int, max_order: int, method: str = "cv") -> int
+```
+Pick the polynomial order in `[0, max_order]` for `fit_chunks` with `n_chunks` chunks.
+`method="cv"`: k-fold cross-validation; `method="aic"`: Akaike information criterion.
+
+### Benchmark CLI: `fitting_cli.py` (repo root)
+
+`python fitting_cli.py <csv> --orders 1-10 --chunks 1-10 [--overlap 0] --json out.json`
+reads the first two CSV columns as x, y (first 1000 rows), computes `error_map` and writes JSON:
+`{"orders": [...], "chunks": [...], "overlap": 0, "error_map": [[...]], "seconds": float,
+"best": {"order": int, "chunks": int, "rmse": float}}` where `error_map[i][j]` is for
+`orders[i]`, `chunks[j]` and `best` is the minimum-RMSE cell. Exit code 0 on success.
 
 ## Also required
 
