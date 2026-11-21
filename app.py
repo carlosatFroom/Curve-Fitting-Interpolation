@@ -1,28 +1,98 @@
-from msilib import datasizemask
-import pyqtgraph as pg, matplotlib, numpy as np, pathlib
-from PyQt5 import QtCore, QtGui, QtWidgets
-from PyQt5.QtWidgets import QFileDialog, QMessageBox, QSlider
-from pyqtgraph import *
-import numpy as np
+import os
 import pathlib
-from sympy import S, symbols, printing
-from mainapp import Ui_MainWindow
+import sys
+import threading
+
+import matplotlib
+
+matplotlib.use('Qt5Agg')
+
+import numpy as np
+import pandas as pd
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg
 from matplotlib.figure import Figure
-import matplotlib.pyplot as plt
 from mpl_toolkits.axes_grid1 import make_axes_locatable
-import threading
-import pandas as pd
+from PyQt5 import QtCore, QtWidgets
+from PyQt5.QtWidgets import QFileDialog, QSlider
+from sympy import S, printing, symbols
 
-matplotlib.use('QT5Agg')
+import fitting
+from mainapp import Ui_MainWindow
+
+BACKGROUND = (242 / 255, 243 / 255, 245 / 255)
+ROW_LIMIT = 1000
+CHUNK_PLOT_POINTS = 50
+EXTRAPOLATION_MIN_FRACTION = 1e-6
+OVERLAPS = list(range(0, 26, 5))
+AXIS_NAMES = ('number of chunks', 'polynomial order', 'overlapping percentage')
+# map key -> (row axis, column axis); axis ids: 0 chunks, 1 order, 2 overlap
+MAP_AXES = {
+    'order_chunks': (1, 0),
+    'chunks_overlap': (0, 2),
+    'order_overlap': (1, 2),
+}
+
+
+def compute_error_maps(x, y, max_order, max_chunks, fixed_order, is_cancelled=lambda: False):
+    """Raw RMSE maps for the three axis pairs. Returns None if cancelled between maps."""
+    if max_order < 2 or max_chunks < 2:
+        raise ValueError("max_order and max_chunks must be >= 2")
+    orders = list(range(1, max_order + 1))
+    chunks = list(range(1, min(max_chunks, len(x)) + 1))
+    fixed_chunks = min(5, len(x))
+    jobs = {
+        'order_chunks': lambda: fitting.error_map(x, y, orders, chunks, [0]),
+        'chunks_overlap': lambda: fitting.error_map(x, y, [fixed_order], chunks, OVERLAPS),
+        'order_overlap': lambda: fitting.error_map(x, y, orders, [fixed_chunks], OVERLAPS),
+    }
+    result = {'orders': orders, 'chunks': chunks, 'overlaps': OVERLAPS}
+    for key, job in jobs.items():
+        if is_cancelled():
+            return None
+        result[key] = job()
+    return result
+
+
+def normalize_to_percent(m):
+    out = np.array(m, dtype=float)
+    if np.isfinite(out).any() and np.nanmax(out) > 0:
+        out = out / np.nanmax(out) * 100
+    return out
+
+
+def cell_extent(values):
+    step = values[1] - values[0] if len(values) > 1 else 1
+    return float(values[0] - step / 2), float(values[-1] + step / 2)
+
+
+def latex_equation(coeffs):
+    x = symbols('x')
+    poly = sum(S(f"{c:6.2f}") * x ** i for i, c in enumerate(coeffs[::-1]))
+    return printing.latex(poly)
+
+
+class ErrorMapWorker(QtCore.QThread):
+    """Computes numbers only; the GUI thread draws the result."""
+    resultReady = QtCore.pyqtSignal(object)
+
+    def __init__(self, x, y, max_order, max_chunks, fixed_order, parent=None):
+        super().__init__(parent)
+        self._args = (x, y, max_order, max_chunks, fixed_order)
+        self._cancel = threading.Event()
+
+    def cancel(self):
+        self._cancel.set()
+
+    def run(self):
+        self.resultReady.emit(compute_error_maps(*self._args, is_cancelled=self._cancel.is_set))
 
 
 class MatplotlibCanvas(FigureCanvasQTAgg):
-    def __init__(self,parent=None, dpi = 120):
-        self.fig, self.axes = plt.subplots()
-        super(MatplotlibCanvas,self).__init__(self.fig)
-        self.axes.set_facecolor((242/255,243/255,245/255))
-        self.fig.set_facecolor((242/255,243/255,245/255))
+    def __init__(self, parent=None):
+        self.fig = Figure(facecolor=BACKGROUND)
+        self.axes = self.fig.add_subplot(111)
+        super().__init__(self.fig)
+        self.axes.set_facecolor(BACKGROUND)
 
 
 class mainApp(QtWidgets.QMainWindow):
@@ -42,15 +112,12 @@ class mainApp(QtWidgets.QMainWindow):
         self.ui.SliderOfChunks.setTickInterval(1)
         self.ui.SliderOfChunks.setTickPosition(QSlider.TicksBelow)
 
-
-
-        self.mainSignalDataPlotter = self.ui.mainSignal.plot([], [], pen = "k")
-        self.verticalLinePlotter = self.ui.mainSignal.plot([],[], pen = "g")
-        self.extraPolationPlotter = self.ui.mainSignal.plot([],[], pen = "r")
-
+        self.mainSignalDataPlotter = self.ui.mainSignal.plot([], [], pen="k")
+        self.verticalLinePlotter = self.ui.mainSignal.plot([], [], pen="g")
+        self.extraPolationPlotter = self.ui.mainSignal.plot([], [], pen="r")
 
         self.chunkplotter = self.ui.mainSignal
-        self.ui.actionopen.triggered.connect(lambda :self.read_file())
+        self.ui.actionopen.triggered.connect(lambda: self.read_file())
         self.ui.SliderOfOrder.valueChanged.connect(self.chunks)
         self.ui.SliderOfChunks.valueChanged.connect(self.chunks)
 
@@ -65,290 +132,176 @@ class mainApp(QtWidgets.QMainWindow):
         self.latexWriter.axes.set_axis_off()
         self.ui.latexLayout.addWidget(self.latexWriter)
 
-        self.xAxisValuesOfOriginalSignal, self.yAxisValuesOfOriginalSignal = [[],[]]
+        self.xAxisValuesOfOriginalSignal = np.array([])
+        self.yAxisValuesOfOriginalSignal = np.array([])
+        self.FileName = ""
+
+        self.errorMapWorker = None
+        self.errorMapGenerated = False
+        self.errorMaps = {}
+        self.errorMapAxes = {}
 
         self.ui.showErrorMapCheckBox.stateChanged.connect(self.showHideErrorMap)
         self.ui.extrapolationCheckBox.stateChanged.connect(self.extraPolationToggle)
-        # self.ui.extrapolationCheckBox.stateChanged.connect()
         self.ui.generateErrorMapBtn.clicked.connect(self.errorMapStart)
         self.ui.cancelBtn.clicked.connect(self.errorMapCancel)
-        self.ui.xAxesComboBox.currentIndexChanged['int'].connect(self.showErrorMap)
-        self.ui.yAxesComboBox.currentIndexChanged['int'].connect(self.showErrorMap)
-        self.errorMapGenerated = False
+        self.ui.xAxesComboBox.currentIndexChanged.connect(lambda _index: self.showErrorMap())
+        self.ui.yAxesComboBox.currentIndexChanged.connect(lambda _index: self.showErrorMap())
         divider = make_axes_locatable(self.errorMapCanv.axes)
         self.cax = divider.append_axes('right', size='5%', pad=0.05)
-        self.cax.set_facecolor((242/255,243/255,245/255))
-        
+        self.cax.set_facecolor(BACKGROUND)
 
-    def errorMapStart(self):
-        self.errorMapProcessor = threading.Thread(target=self.generateErrorMap)
-        self.stopFlag = False
-        self.errorMapProcessor.start()
+    def closeEvent(self, event):
+        if self.errorMapWorker is not None and self.errorMapWorker.isRunning():
+            self.errorMapWorker.cancel()
+            self.errorMapWorker.wait()
+        super().closeEvent(event)
 
-    def errorMapCancel(self):
-        self.stopFlag = True
+    def setSignal(self, x, y):
+        self.xAxisValuesOfOriginalSignal = np.asarray(x, dtype=float)
+        self.yAxisValuesOfOriginalSignal = np.asarray(y, dtype=float)
+        self.mainSignalDataPlotter.setData(self.xAxisValuesOfOriginalSignal, self.yAxisValuesOfOriginalSignal)
+        if self.yAxisValuesOfOriginalSignal.size:
+            self.ui.mainSignal.setLimits(yMin=self.yAxisValuesOfOriginalSignal.min(),
+                                         yMax=self.yAxisValuesOfOriginalSignal.max())
 
+    def read_file(self):
+        path = QFileDialog.getOpenFileName()[0]
+        if not path:
+            return
+        self.FileName = os.path.basename(path)
+        if pathlib.Path(path).suffix != ".csv":
+            self.statusBar().showMessage("only .csv files are supported")
+            return
+        data = np.genfromtxt(path, delimiter=',')
+        self.setSignal(data[:ROW_LIMIT, 0], data[:ROW_LIMIT, 1])
+
+    def chunks(self):
+        x, y = self.xAxisValuesOfOriginalSignal, self.yAxisValuesOfOriginalSignal
+        if x.size == 0:
+            return
+        self.chunkplotter.clear()
+        self.chunkplotter.plot(x, y, pen="k")
+        self.latexWriter.axes.clear()
+
+        n_chunks = min(self.ui.SliderOfChunks.value(), x.size)
+        if n_chunks > 0:
+            fits = fitting.fit_chunks(x, y, n_chunks, self.ui.SliderOfOrder.value())
+            rows = {'Chunk': [], 'equation': [], 'RMSE': []}
+            for i, fit in enumerate(fits):
+                x_plot = np.linspace(fit.x_min, fit.x_max, CHUNK_PLOT_POINTS)
+                self.chunkplotter.plot(x_plot, fit.predict(x_plot), symbol='o')
+                rows['Chunk'].append(f'eq of chunk {i + 1}')
+                rows['equation'].append(f'${latex_equation(fit.coeffs)}$')
+                rows['RMSE'].append(f'{fit.rmse:.4g}')
+            table_frame = pd.DataFrame(rows)
+            table = self.latexWriter.axes.table(cellText=table_frame.values, colLabels=table_frame.columns,
+                                                loc='center')
+            table.auto_set_column_width(col=list(range(len(table_frame.columns))))
+            table.scale(1, 1.5)
+            table.auto_set_font_size(True)
+
+        self.latexWriter.fig.tight_layout()
+        self.latexWriter.axes.set_axis_off()
+        self.latexWriter.draw()
 
     def showHideErrorMap(self, state):
-        if (state == QtCore.Qt.Checked):
-            self.errorMapCanv.setVisible(True)
-        else:
-            self.errorMapCanv.setVisible(False)
+        self.errorMapCanv.setVisible(state == QtCore.Qt.Checked)
 
     def extraPolationToggle(self, state):
-
-        if (state == QtCore.Qt.Checked):
+        if state == QtCore.Qt.Checked:
             self.ui.SliderOfOrder.valueChanged.disconnect(self.chunks)
             self.ui.SliderOfChunks.valueChanged.disconnect(self.chunks)
             self.chunkplotter.clear()
             self.ui.chunksLabel.setText("extrapolation")
             self.ui.SliderOfChunks.valueChanged.connect(self.updateExtraPolation)
             self.ui.SliderOfOrder.valueChanged.connect(self.updateExtraPolation)
-            self.mainSignalDataPlotter = self.ui.mainSignal.plot(self.xAxisValuesOfOriginalSignal, self.yAxisValuesOfOriginalSignal, pen = "k")
-            self.verticalLinePlotter = self.ui.mainSignal.plot([],[], pen = "g")
-            self.extraPolationPlotter = self.ui.mainSignal.plot([],[], pen = "r")
+            self.mainSignalDataPlotter = self.ui.mainSignal.plot(
+                self.xAxisValuesOfOriginalSignal, self.yAxisValuesOfOriginalSignal, pen="k")
+            self.verticalLinePlotter = self.ui.mainSignal.plot([], [], pen="g")
+            self.extraPolationPlotter = self.ui.mainSignal.plot([], [], pen="r")
             self.updateExtraPolation()
-
         else:
             self.ui.SliderOfOrder.valueChanged.disconnect(self.updateExtraPolation)
             self.ui.SliderOfChunks.valueChanged.disconnect(self.updateExtraPolation)
             self.ui.chunksLabel.setText("Chunks")
             self.ui.SliderOfChunks.valueChanged.connect(self.chunks)
             self.ui.SliderOfOrder.valueChanged.connect(self.chunks)
-            self.verticalLinePlotter.setData([],[])
-            self.extraPolationPlotter.setData([],[])
+            self.verticalLinePlotter.setData([], [])
+            self.extraPolationPlotter.setData([], [])
             self.chunks()
 
     def updateExtraPolation(self):
-
-
-        extraPolationEndIndex = self.ui.SliderOfChunks.value()*100
-        verticalLineXIndex = max(self.xAxisValuesOfOriginalSignal)*extraPolationEndIndex/1000
-        polynomialOrder = self.ui.SliderOfOrder.value()
-        polynomial = np.polyfit(self.xAxisValuesOfOriginalSignal[:extraPolationEndIndex], self.yAxisValuesOfOriginalSignal[:extraPolationEndIndex], polynomialOrder)
-        polynomialVals = np.poly1d(polynomial)
-        self.verticalLinePlotter.setData([verticalLineXIndex,verticalLineXIndex],[min(self.yAxisValuesOfOriginalSignal),max(self.yAxisValuesOfOriginalSignal)])
-        self.extraPolationPlotter.setData(self.xAxisValuesOfOriginalSignal,polynomialVals(self.xAxisValuesOfOriginalSignal))
-    
-    def showErrorMap(self):
-        if self.errorMapGenerated == False:
+        x, y = self.xAxisValuesOfOriginalSignal, self.yAxisValuesOfOriginalSignal
+        if x.size == 0:
             return
+        order = self.ui.SliderOfOrder.value()
+        fraction = max(self.ui.SliderOfChunks.value() / 10, EXTRAPOLATION_MIN_FRACTION)
+        # same point count as fitting.extrapolate: at least order+1 points
+        n_fit = min(x.size, max(order + 1, int(round(fraction * x.size))))
+        _, y_pred = fitting.extrapolate(x, y, fraction, order)
+        x_line = x[n_fit - 1]
+        self.verticalLinePlotter.setData([x_line, x_line], [y.min(), y.max()])
+        self.extraPolationPlotter.setData(x, y_pred)
 
-        self.errorMapCanv.axes.clear()
+    def errorMapStart(self):
+        if self.errorMapWorker is not None and self.errorMapWorker.isRunning():
+            return
+        x, y = self.xAxisValuesOfOriginalSignal, self.yAxisValuesOfOriginalSignal
+        if x.size == 0:
+            self.statusBar().showMessage("load data first")
+            return
+        max_order = self.ui.orderOfFittingPolynomialErrorMapSlider.value()
+        max_chunks = self.ui.numberOfChunksErrorMapSlider.value()
+        if max_order < 2 or max_chunks < 2:
+            self.statusBar().showMessage("set both error map sliders to 2 or more")
+            return
+        fixed_order = self.ui.SliderOfOrder.value() or 5
+        self.errorMapWorker = ErrorMapWorker(x.copy(), y.copy(), max_order, max_chunks, fixed_order, self)
+        self.errorMapWorker.resultReady.connect(self.onErrorMapReady)
+        self.errorMapWorker.start()
+        self.statusBar().showMessage("computing error map...")
+
+    def errorMapCancel(self):
+        if self.errorMapWorker is not None and self.errorMapWorker.isRunning():
+            self.errorMapWorker.cancel()
+            self.statusBar().showMessage("cancelling after current map...")
+
+    def onErrorMapReady(self, result):
+        """GUI thread: normalise the raw maps and draw the selected pair."""
+        if result is None:
+            self.statusBar().showMessage("error map cancelled")
+            return
+        self.errorMapAxes = {0: result['chunks'], 1: result['orders'], 2: result['overlaps']}
+        self.errorMaps = {key: normalize_to_percent(result[key]) for key in MAP_AXES}
+        self.errorMapGenerated = True
+        self.statusBar().showMessage("error map ready")
+        self.showErrorMap()
+
+    def _errorMapFor(self, x_axis, y_axis):
+        """Normalised map with rows = y_axis, columns = x_axis."""
+        for key, (row_axis, col_axis) in MAP_AXES.items():
+            if {row_axis, col_axis} == {x_axis, y_axis}:
+                m = self.errorMaps[key]
+                return m if row_axis == y_axis else m.T
+        raise ValueError("x and y axes must differ")
+
+    def showErrorMap(self):
+        x_axis = self.ui.xAxesComboBox.currentIndex()
+        y_axis = self.ui.yAxesComboBox.currentIndex()
+        if not self.errorMapGenerated or x_axis == y_axis:
+            return
+        ax = self.errorMapCanv.axes
+        ax.clear()
         self.cax.clear()
-        
-        xAxesComboBoxIndex = self.ui.xAxesComboBox.currentIndex()
-        yAxesComboBoxIndex = self.ui.yAxesComboBox.currentIndex()
-        
-        if (xAxesComboBoxIndex == 0 and yAxesComboBoxIndex == 1):
-            image = self.errorMapCanv.axes.imshow(self.polynomialOrderToNumberOfChunksError,cmap = "inferno",extent=[0,self.maxNumberOfChunks,0,self.maxPolyNomialOrder])
-            self.errorMapCanv.axes.set_xlabel("number of chunks")
-            self.errorMapCanv.axes.set_ylabel("polynomial order")
-        elif (xAxesComboBoxIndex == 1 and yAxesComboBoxIndex == 0):
-            image = self.errorMapCanv.axes.imshow(self.numberOfChunksToPolynomialOrderError,cmap = "inferno",extent=[0,self.maxPolyNomialOrder,0,self.maxNumberOfChunks])
-            self.errorMapCanv.axes.set_xlabel("polynomial order")
-            self.errorMapCanv.axes.set_ylabel("number of chunks")
-
-        elif (xAxesComboBoxIndex == 0 and yAxesComboBoxIndex == 2):
-            image = self.errorMapCanv.axes.imshow(self.overLappingPercentageToNumberOfChunksError,cmap = "inferno",extent=[0,self.maxNumberOfChunks,0,25])
-            self.errorMapCanv.axes.set_xlabel("number of chunks")
-            self.errorMapCanv.axes.set_ylabel("overlapping percentage")
-        elif (xAxesComboBoxIndex == 2 and yAxesComboBoxIndex == 0):
-            image = self.errorMapCanv.axes.imshow(self.numberOfChunksToOverLappingPercentageError,cmap = "inferno",extent=[0,25,0,self.maxNumberOfChunks])
-            self.errorMapCanv.axes.set_xlabel("overlapping percentage")
-            self.errorMapCanv.axes.set_ylabel("number of chunks")
-        
-        elif (xAxesComboBoxIndex == 1 and yAxesComboBoxIndex == 2):
-            image = self.errorMapCanv.axes.imshow(self.overLappingPercentageToPolynomialOrderError,cmap = "inferno",extent=[0,self.maxPolyNomialOrder,0,25])
-            self.errorMapCanv.axes.set_xlabel("polynomial order")
-            self.errorMapCanv.axes.set_ylabel("overlapping percentage")
-        else:
-            image = self.errorMapCanv.axes.imshow(self.polynomialOrderToOverlappingPercentageError,cmap = "inferno",extent=[0,25,0,self.maxPolyNomialOrder])
-            self.errorMapCanv.axes.set_xlabel("overlapping percentage")
-            self.errorMapCanv.axes.set_ylabel("polynomial order")
-
-
+        x_vals, y_vals = self.errorMapAxes[x_axis], self.errorMapAxes[y_axis]
+        image = ax.imshow(self._errorMapFor(x_axis, y_axis), cmap="inferno", origin='lower',
+                          extent=[*cell_extent(x_vals), *cell_extent(y_vals)])
+        ax.set_xlabel(AXIS_NAMES[x_axis])
+        ax.set_ylabel(AXIS_NAMES[y_axis])
         self.errorMapCanv.fig.colorbar(image, cax=self.cax, orientation='vertical')
         self.errorMapCanv.fig.tight_layout()
         self.errorMapCanv.draw()
-
-    def get2DErrorArray(self, polynomialOrderVals = [5], numberOfChunksVals = [5], overlappingSizePercentageVals = [0]):
-
-        if (len(polynomialOrderVals) != 1 and len(numberOfChunksVals) != 1):
-            errorMap = np.zeros((len(polynomialOrderVals),len(numberOfChunksVals)))
-        elif (len(polynomialOrderVals) != 1):
-            errorMap = np.zeros((len(polynomialOrderVals),len(overlappingSizePercentageVals)))
-        else:
-            errorMap = np.zeros((len(overlappingSizePercentageVals),len(numberOfChunksVals)))
-
-        for polynomialOrder in polynomialOrderVals:
-            for overlappingSizePercentage in overlappingSizePercentageVals:
-                for numberOfChunks in numberOfChunksVals:
-                    if (self.stopFlag):
-                        return
-
-                    xAxesChunksValues = np.array_split(self.xAxisValuesOfOriginalSignal,numberOfChunks)
-                    yAxesChunksValues = np.array_split(self.yAxisValuesOfOriginalSignal,numberOfChunks)
-
-                    chunkSize = int(len(self.xAxisValuesOfOriginalSignal) / numberOfChunks)
-                    overlappedPointsNumber = int(chunkSize * overlappingSizePercentage /100)
-                    resError = 0
-
-                    for chunkIndex in range(numberOfChunks):
-
-                        chunkStartIndex = (chunkIndex)*len(xAxesChunksValues[chunkIndex])
-                        chunkEndIndex = chunkStartIndex + len(xAxesChunksValues[chunkIndex])
-
-                        if (numberOfChunks > 1):
-                            
-                            # case 1: we want append to the first chunk
-                            if (chunkIndex == 0):
-                                chunkEndIndex += overlappedPointsNumber
-                                
-                            # case 2: we want to append to the last chunk
-                            elif (chunkIndex == (numberOfChunks - 1)):
-                                chunkStartIndex -= overlappedPointsNumber
-                                
-                            # case 3: we want to append to a mid chunk
-                            else:
-                                chunkStartIndex -= int(overlappedPointsNumber/2)
-                                chunkEndIndex += int(np.ceil(overlappedPointsNumber/2))
-
-                        xAxesChunksValues[chunkIndex] = self.xAxisValuesOfOriginalSignal[chunkStartIndex:chunkEndIndex]
-                        yAxesChunksValues[chunkIndex] = self.yAxisValuesOfOriginalSignal[chunkStartIndex:chunkEndIndex]
-                        polynomial = np.polyfit(xAxesChunksValues[chunkIndex], yAxesChunksValues[chunkIndex], polynomialOrder)  
-                        resError += np.sum((np.polyval(polynomial, xAxesChunksValues[chunkIndex]) - yAxesChunksValues[chunkIndex])**2)
-                    
-                    resError /= numberOfChunks
-                    error = np.sqrt(resError/(len(self.xAxisValuesOfOriginalSignal)-2))
-                    
-                    if (len(polynomialOrderVals) != 1 and len(numberOfChunksVals) != 1):
-                        errorMap[polynomialOrder - 1][numberOfChunks - 1] = error
-                    elif (len(polynomialOrderVals) != 1):
-                        errorMap[polynomialOrder - 1][int(overlappingSizePercentage/5)] = error
-                    else:
-                        errorMap[int(overlappingSizePercentage/5)][numberOfChunks - 1] = error
-
-        return errorMap
-
-    def normalizeAndPrepData(self,data):
-        normalizedData = self.normalizeData(data)
-        swapedAxesNormalizedData_errorMapModified = np.flip(np.transpose(data),0)
-        normalizedData_errorMapModified = np.flip(normalizedData,0)
-        return [normalizedData_errorMapModified, swapedAxesNormalizedData_errorMapModified]
-
-    def generateErrorMap(self):
-
-        self.maxPolyNomialOrder = self.ui.orderOfFittingPolynomialErrorMapSlider.value()
-        self.maxNumberOfChunks = self.ui.numberOfChunksErrorMapSlider.value()
-        
-
-        error2DArray = self.get2DErrorArray(polynomialOrderVals=range(1,self.maxPolyNomialOrder+1),numberOfChunksVals=range(1,self.maxNumberOfChunks+1))        
-        [self.polynomialOrderToNumberOfChunksError, self.numberOfChunksToPolynomialOrderError] = self.normalizeAndPrepData(error2DArray)
-
-
-        error2DArray = self.get2DErrorArray(overlappingSizePercentageVals=range(0,26,5),numberOfChunksVals=range(1,self.maxNumberOfChunks+1))
-        [self.overLappingPercentageToNumberOfChunksError, self.numberOfChunksToOverLappingPercentageError] = self.normalizeAndPrepData(error2DArray)
-
-
-        error2DArray = self.get2DErrorArray(polynomialOrderVals=range(1,self.maxPolyNomialOrder),overlappingSizePercentageVals=range(0,26,5))
-        [self.polynomialOrderToOverlappingPercentageError, self.overLappingPercentageToPolynomialOrderError] = self.normalizeAndPrepData(error2DArray)
-
-        self.errorMapGenerated = True
-        self.showErrorMap()
-                                       
-    def normalizeData(self,Data):
-        maxOfData = Data.max()
-        for raw in range(len(Data)):
-            for col in range(len(Data[0])):
-                Data[raw][col] = (Data[raw][col])/(maxOfData) * 100
-
-        return Data
-
-    def read_file(self):
-
-        path = QFileDialog.getOpenFileName()[0]
-        self.FileName= os.path.basename(path)
-
-        if pathlib.Path(path).suffix == ".csv":
-            self.data = np.genfromtxt(path, delimiter=',')
-            self.xAxisValuesOfOriginalSignal = self.data[:,0][:1000]
-            self.yAxisValuesOfOriginalSignal = self.data[:,1][:1000]
-            self.mainSignalDataPlotter.setData(self.xAxisValuesOfOriginalSignal, self.yAxisValuesOfOriginalSignal)
-
-        self.ui.mainSignal.setLimits(yMin = min(self.yAxisValuesOfOriginalSignal), yMax = max(self.yAxisValuesOfOriginalSignal))
-
-    def chunks(self):
-        # self.errorMapCanv.setVisible(True)
-        # else:
-        #     self.errorMapCanv.setVisible(False)
-        tableData = {'Chunk': [], 'equation': [], 'error%': []}
-        self.numberofChunkies = self.ui.SliderOfChunks.value()
-        self.chunkplotter.clear()
-        self.chunkplotter.plot(self.xAxisValuesOfOriginalSignal, self.yAxisValuesOfOriginalSignal,pen = "k")
-        self.i=0
-        self.xAxisValuesofsplit=np.array_split(self.xAxisValuesOfOriginalSignal, self.numberofChunkies)
-        self.yAxisValuesofsplit=np.array_split(self.yAxisValuesOfOriginalSignal, self.numberofChunkies)
-        # self.latexWriter.axes.clear()
-        # self.latexWriter.axes.set_axis_off()
-        # self.ui.equationWriter.clear()
-        if(self.numberofChunkies > 0):
-
-            for chunkidx in range(self.numberofChunkies):
-                order = self.ui.SliderOfOrder.value()
-                self.polynomial = numpy.polyfit(self.xAxisValuesofsplit[chunkidx], self.yAxisValuesofsplit[chunkidx], order)
-                self.xAxischunks = np.linspace(min(self.xAxisValuesofsplit[chunkidx]),max(self.xAxisValuesofsplit[chunkidx]))
-                self.yAxischunks = np.polyval(self.polynomial, self.xAxischunks)
-                # print(self.yAxischunks)
-
-                self.res = numpy.sum((numpy.polyval(
-                    numpy.polyfit(self.xAxisValuesofsplit[chunkidx], self.yAxisValuesofsplit[chunkidx], order),
-                    self.xAxisValuesofsplit[chunkidx]) - self.yAxisValuesofsplit[chunkidx]) ** 2)
-
-                self.res /= self.numberofChunkies
-                self.error1 = np.sqrt(self.res / (len(self.xAxisValuesOfOriginalSignal) - 2))
-
-                self.error = self.error1 * 100
-
-
-
-                self.xAxisValuesofsplit[chunkidx] = symbols("x")
-                self.poly = sum(S("{:6.2f}".format(v)) * self.xAxisValuesofsplit[chunkidx] ** i
-                                                for i, v in enumerate(self.polynomial [::-1]))
-                self.eq_latex = printing.latex(self.poly)
-
-
-                self.chunkplotter.plot(self.xAxischunks, self.yAxischunks, symbol='o')
-                tableData['error%'].append(round(self.error, 3))
-                tableData['equation'].append(f'${self.eq_latex}$')
-                tableData['Chunk'].append(f'eq of chunk {(chunkidx+1)}')
-
-                # self.ui.equationWriter.append(f'eq of chunk {(chunkidx+1)}: ' + self.eq_latex)
-                # self.ui.equationWriter.append('percentage error: ' + str(self.error))
-
-            # TableData_frame = pd.DataFrame(tableData) ## framing the table with pandas library
-            self.latexWriter.axes.clear()
-
-            if (order > 0): ## plot the table only if the spin box has value
-                TableData_frame = pd.DataFrame(tableData) ## forming the table with pandas library
-                table=self.latexWriter.axes.table(cellText=TableData_frame.values, colLabels=TableData_frame.columns, loc='center')
-                table.auto_set_column_width(col=list(range(len(TableData_frame.columns)))) ## orientation
-                table.scale(1, 1.5)
-                table.auto_set_font_size(True)
-            
-            # table = self.latexWriter.axes.table(cellText=TableData_frame.values, colLabels=TableData_frame.columns, loc='center')
-            # table.scale(1,2)
-            self.latexWriter.fig.tight_layout()
-            self.latexWriter.axes.set_axis_off()
-            self.latexWriter.draw()
-
-
-
-
-
-
-
-
 
 
 if __name__ == '__main__':
@@ -356,4 +309,3 @@ if __name__ == '__main__':
     main = mainApp()
     main.show()
     sys.exit(app.exec_())
-
